@@ -27,4 +27,10 @@ pub enum Error {
     OpNotScheduled = 23,
     NotBeneficiary = 24,
     VaultPaused = 25,
+    /// refill_stream called before the current cycle has ended
+    StreamNotExpired = 26,
+    /// refill_stream called on a non-recurrent stream
+    NotRecurrent = 27,
+    /// No treasury address configured; admin must call set_treasury first
+    NoTreasury = 28,
 }

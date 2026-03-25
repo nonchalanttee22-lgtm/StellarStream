@@ -32,6 +32,14 @@ pub enum DataKeyV2 {
 
     // -- Time-locked Admin Actions -------------------------------
     ScheduledOp(crate::types::Operation), // 7
+
+    // -- Affiliate Fee Split (Issue: Tokenomics) -----------------
+    /// Protocol treasury address for fee collection
+    Treasury, // 8
+    /// Accumulated pending fees per (recipient, token) pair
+    PendingFees(Address, Address), // 9
+    /// Protocol fee in basis points (e.g. 100 = 1%)
+    FeeBps, // 10
 }
 
 /// Global stream counter.
@@ -311,5 +319,60 @@ pub fn get_scheduled_op_time(env: &Env, op: &crate::types::Operation) -> Option<
 
 pub fn clear_op(env: &Env, op: &crate::types::Operation) {
     env.storage().instance().remove(&DataKeyV2::ScheduledOp(op.clone()));
+    bump_instance(env);
+}
+
+// ----------------------------------------------------------------
+// Affiliate Fee Split helpers (Issue: Tokenomics)
+// ----------------------------------------------------------------
+
+/// Set the protocol treasury address. Admin-only enforcement is in lib.rs.
+pub fn set_treasury(env: &Env, treasury: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKeyV2::Treasury, treasury);
+    bump_instance(env);
+}
+
+/// Return the treasury address, if configured.
+pub fn get_treasury(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKeyV2::Treasury)
+}
+
+/// Set the protocol fee in basis points. Admin-only enforcement is in lib.rs.
+pub fn set_fee_bps(env: &Env, bps: u32) {
+    env.storage().instance().set(&DataKeyV2::FeeBps, &bps);
+    bump_instance(env);
+}
+
+/// Return the current fee BPS (default 0 = no fee).
+pub fn get_fee_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKeyV2::FeeBps)
+        .unwrap_or(0)
+}
+
+/// Add `amount` to the pending fee balance for `(recipient, token)`.
+pub fn add_pending_fees(env: &Env, recipient: &Address, token: &Address, amount: i128) {
+    let key = DataKeyV2::PendingFees(recipient.clone(), token.clone());
+    let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+    env.storage().instance().set(&key, &(current + amount));
+    bump_instance(env);
+}
+
+/// Return the accumulated pending fee balance for `(recipient, token)`.
+pub fn get_pending_fees(env: &Env, recipient: &Address, token: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKeyV2::PendingFees(recipient.clone(), token.clone()))
+        .unwrap_or(0)
+}
+
+/// Clear the pending fee balance for `(recipient, token)` after withdrawal.
+pub fn clear_pending_fees(env: &Env, recipient: &Address, token: &Address) {
+    env.storage()
+        .instance()
+        .remove(&DataKeyV2::PendingFees(recipient.clone(), token.clone()));
     bump_instance(env);
 }

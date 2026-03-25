@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 use soroban_sdk::xdr::ToXdr;
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, IntoVal, Symbol, Vec};
 
 mod contracterror;
 mod storage;
@@ -10,10 +10,12 @@ mod v1_interface;
 
 use contracterror::Error;
 pub use types::{
-    AdminTransferredEvent, BatchStreamsCreatedEvent, BeneficiaryTransferredV2Event, ClawbackRebalanceEvent,
-    ContractPausedEvent, ContractUnpausedEvent, MigrationEvent, Operation, OperationExecutedEvent,
-    OperationScheduledEvent, PermitArgs, PermitStreamCreatedEvent, StreamArgs, StreamCancelledV2Event,
-    StreamClaimV2Event, StreamCreatedV2Event, StreamMigratedEvent, StreamToppedUpEvent, StreamV2,
+    AdminTransferredEvent, BatchStreamsCreatedEvent, BeneficiaryTransferredV2Event,
+    ClawbackRebalanceEvent, ContractPausedEvent, ContractUnpausedEvent, FeesWithdrawnEvent,
+    MigrationEvent, NebulaEvent, Operation, OperationExecutedEvent, OperationScheduledEvent,
+    PermitArgs, PermitStreamCreatedEvent, StreamArgs, StreamBatchEntry, StreamCancelledV2Event,
+    StreamClaimV2Event, StreamCreatedV2Event, StreamMigratedEvent, StreamRefilledEvent,
+    StreamStatus, StreamToppedUpEvent, StreamV2,
 };
 use v1_interface::Client as V1Client;
 
@@ -87,12 +89,19 @@ impl Contract {
         let previous_admin = storage::try_get_admin(&env)?;
         storage::set_admin(&env, &new_admin);
 
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(previous_admin.into_val(&env));
+        data.push_back(new_admin.clone().into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
             (symbol_short!("adm_xfer"), new_admin.clone()),
-            AdminTransferredEvent {
-                previous_admin,
-                new_admin,
-                timestamp: env.ledger().timestamp(),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("adm_xfer"),
+                data,
             },
         );
         Ok(())
@@ -199,26 +208,29 @@ impl Contract {
             vault_address: None,
             yield_enabled: false,
             is_pending: false,
+            is_recurrent: false,
+            cycle_duration: 0,
+            cancellation_type: 0,
         };
 
         storage::set_stream(&env, v2_stream_id, &v2_stream);
         storage::update_stats(&env, remaining, &v1_stream.sender, &caller);
 
-        env.events().publish(
-            (symbol_short!("migrated"), caller.clone()),
-            StreamMigratedEvent {
-                v2_stream_id,
-                v1_stream_id,
-                caller: caller.clone(),
-                migrated_amount: remaining,
-                timestamp: now,
-            },
-        );
+        let mut data = Vec::new(&env);
+        data.push_back(v2_stream_id.into_val(&env));
+        data.push_back(v1_stream_id.into_val(&env));
+        data.push_back(caller.clone().into_val(&env));
+        data.push_back(remaining.into_val(&env));
+        data.push_back(now.into_val(&env));
 
-        // Emit migration event for indexer
         env.events().publish(
-            (Symbol::new(&env, "migrate"),),
-            (v1_stream_id, v2_stream_id, caller.clone(), remaining),
+            (v2_stream_id, symbol_short!("migrated")),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("migrated"),
+                data,
+            },
         );
 
         Ok(v2_stream_id)
@@ -276,7 +288,7 @@ impl Contract {
 
     pub fn withdraw(env: Env, stream_id: u64, beneficiary: Address) -> Result<i128, Error> {
         Self::require_not_paused(&env)?;
-        receiver.require_auth();
+        beneficiary.require_auth();
 
         let mut stream =
             storage::get_stream(&env, stream_id).ok_or(Error::StreamNotFound)?;
@@ -330,14 +342,20 @@ impl Contract {
         // Update analytics (TVL decreased)
         storage::update_stats(&env, -to_withdraw, &stream.sender, &stream.receiver);
 
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(stream.beneficiary.clone().into_val(&env));
+        data.push_back(to_withdraw.into_val(&env));
+        data.push_back(stream.withdrawn_amount.into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
-            (symbol_short!("claim"), stream.beneficiary.clone()),
-            StreamClaimV2Event {
-                stream_id,
-                receiver: stream.beneficiary.clone(),
-                amount: to_withdraw,
-                total_claimed: stream.withdrawn_amount,
+            (stream_id, symbol_short!("claim")),
+            NebulaEvent {
+                version: 2,
                 timestamp: now,
+                action: symbol_short!("claim"),
+                data,
             },
         );
 
@@ -346,18 +364,24 @@ impl Contract {
 
     pub fn cancel(env: Env, stream_id: u64, caller: Address) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
-        caller.require_auth();
 
         let mut stream =
             storage::get_stream(&env, stream_id).ok_or(Error::StreamNotFound)?;
 
-        if stream.sender != caller && stream.beneficiary != caller {
-            return Err(Error::NotStreamOwner);
-
-        }
-
         if stream.cancelled {
             return Err(Error::AlreadyCancelled);
+        }
+
+        // Authorization: mutual (type=1) requires both sender AND receiver to sign;
+        // unilateral (type=0, default) only requires the initiating party.
+        if stream.cancellation_type == 1 {
+            stream.sender.require_auth();
+            stream.receiver.require_auth();
+        } else {
+            if stream.sender != caller && stream.beneficiary != caller {
+                return Err(Error::NotStreamOwner);
+            }
+            caller.require_auth();
         }
 
         let now = env.ledger().timestamp();
@@ -396,14 +420,20 @@ impl Contract {
             token_client.transfer(&env.current_contract_address(), &stream.sender, &to_sender);
         }
 
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(caller.clone().into_val(&env));
+        data.push_back(to_receiver.into_val(&env));
+        data.push_back(to_sender.into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
-            (symbol_short!("cancel"), caller.clone()),
-            StreamCancelledV2Event {
-                stream_id,
-                canceller: caller,
-                to_receiver,
-                to_sender,
+            (stream_id, symbol_short!("cancel")),
+            NebulaEvent {
+                version: 2,
                 timestamp: now,
+                action: symbol_short!("cancel"),
+                data,
             },
         );
 
@@ -427,13 +457,20 @@ impl Contract {
 
         storage::set_stream(&env, stream_id, &stream);
 
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(previous_beneficiary.into_val(&env));
+        data.push_back(new_beneficiary.into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
-            (symbol_short!("benefic"), stream_id),
-            BeneficiaryTransferredV2Event {
-                stream_id,
-                previous_beneficiary,
-                new_beneficiary,
-                timestamp: env.ledger().timestamp(),
+            (stream_id, symbol_short!("benefic")),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("benefic"),
+                data,
             },
         );
 
@@ -551,15 +588,21 @@ impl Contract {
         // Update TVL.
         storage::update_stats(&env, extra_amount, &stream.sender, &stream.receiver);
 
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(sender.clone().into_val(&env));
+        data.push_back(extra_amount.into_val(&env));
+        data.push_back(stream.total_amount.into_val(&env));
+        data.push_back(new_end_time.into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
-            (symbol_short!("top_up"), sender.clone()),
-            StreamToppedUpEvent {
-                stream_id,
-                sender,
-                extra_amount,
-                new_total_amount: stream.total_amount,
-                new_end_time,
+            (stream_id, symbol_short!("top_up")),
+            NebulaEvent {
+                version: 2,
                 timestamp: now,
+                action: symbol_short!("top_up"),
+                data,
             },
         );
 
@@ -597,11 +640,17 @@ impl Contract {
         let admin = storage::try_get_admin(&env)?;
         admin.require_auth();
         storage::set_paused(&env, true);
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(admin.clone().into_val(&env));
+        data.push_back(now.into_val(&env));
         env.events().publish(
             (symbol_short!("pause"), admin.clone()),
-            ContractPausedEvent {
-                admin,
-                timestamp: env.ledger().timestamp(),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("pause"),
+                data,
             },
         );
         Ok(())
@@ -611,11 +660,17 @@ impl Contract {
         let admin = storage::try_get_admin(&env)?;
         admin.require_auth();
         storage::set_paused(&env, false);
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(admin.clone().into_val(&env));
+        data.push_back(now.into_val(&env));
         env.events().publish(
             (symbol_short!("unpause"), admin.clone()),
-            ContractUnpausedEvent {
-                admin,
-                timestamp: env.ledger().timestamp(),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("unpause"),
+                data,
             },
         );
         Ok(())
@@ -673,14 +728,21 @@ impl Contract {
             }
         }
 
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(token.clone().into_val(&env));
+        data.push_back(sum_remaining.into_val(&env));
+        data.push_back(balance.into_val(&env));
+        data.push_back(reduction_factor_bps.into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
             (symbol_short!("rebalance"), token.clone()),
-            ClawbackRebalanceEvent {
-                token,
-                total_remaining: sum_remaining,
-                contract_balance: balance,
-                reduction_factor_bps,
-                timestamp: env.ledger().timestamp(),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("rebalance"),
+                data,
             },
         );
 
@@ -716,13 +778,45 @@ impl Contract {
             &args.total_amount,
         );
 
+        // ---- Affiliate Fee Split (Issue: Tokenomics) ----
+        // If a protocol fee is configured AND a treasury is set, deduct the fee
+        // from total_amount: 70% goes to MainTreasury, 30% to AffiliateAddress.
+        // Fees are stored in PendingFees for batch withdrawal.
+        let fee_bps = storage::get_fee_bps(&env);
+        let stream_amount = if fee_bps > 0 {
+            if let Some(treasury) = storage::get_treasury(&env) {
+                let fee = (args.total_amount * fee_bps as i128) / 10_000;
+                if fee > 0 {
+                    let treasury_share = (fee * 70) / 100;
+                    let affiliate_share = fee - treasury_share;
+
+                    storage::add_pending_fees(&env, &treasury, &args.token, treasury_share);
+
+                    if let Some(ref affiliate) = args.affiliate {
+                        storage::add_pending_fees(&env, affiliate, &args.token, affiliate_share);
+                    } else {
+                        // No affiliate — remainder also goes to treasury
+                        storage::add_pending_fees(&env, &treasury, &args.token, affiliate_share);
+                    }
+
+                    args.total_amount - fee
+                } else {
+                    args.total_amount
+                }
+            } else {
+                args.total_amount
+            }
+        } else {
+            args.total_amount
+        };
+
         let stream_id = storage::next_stream_id(&env);
 
         let mut vault_used = None;
         if args.yield_enabled {
             if let Some(vault_addr) = &args.vault_address {
                 let vault_client = VaultClient::new(&env, vault_addr);
-                vault_client.deposit(&args.total_amount);
+                vault_client.deposit(&stream_amount);
                 vault_used = Some(vault_addr.clone());
             }
         }
@@ -732,7 +826,7 @@ impl Contract {
             receiver: args.receiver.clone(),
             beneficiary: args.receiver.clone(),
             token: args.token.clone(),
-            total_amount: args.total_amount,
+            total_amount: stream_amount,
             start_time: args.start_time,
             end_time: args.end_time,
             cliff_time: args.cliff_time,
@@ -745,23 +839,33 @@ impl Contract {
             vault_address: vault_used,
             yield_enabled: args.yield_enabled,
             is_pending: false,
+            is_recurrent: args.is_recurrent,
+            cycle_duration: args.cycle_duration,
+            cancellation_type: args.cancellation_type,
         };
 
         storage::set_stream(&env, stream_id, &stream);
-        storage::update_stats(&env, args.total_amount, &args.sender, &args.receiver);
+        storage::update_stats(&env, stream_amount, &args.sender, &args.receiver);
+
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(args.sender.clone().into_val(&env));
+        data.push_back(args.receiver.clone().into_val(&env));
+        data.push_back(args.token.clone().into_val(&env));
+        data.push_back(stream_amount.into_val(&env));
+        data.push_back(args.start_time.into_val(&env));
+        data.push_back(args.cliff_time.into_val(&env));
+        data.push_back(args.end_time.into_val(&env));
+        data.push_back(now.into_val(&env));
 
         env.events().publish(
-            (symbol_short!("create_v2"), args.sender.clone()),
-            StreamCreatedV2Event {
-                stream_id,
-                sender: args.sender,
-                receiver: args.receiver,
-                token: args.token,
-                total_amount: args.total_amount,
-                start_time: args.start_time,
-                cliff_time: args.cliff_time,
-                end_time: args.end_time,
-                timestamp: env.ledger().timestamp(),
+            (stream_id, symbol_short!("create_v2")),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("create_v2"),
+                data,
             },
         );
 
@@ -848,22 +952,30 @@ impl Contract {
             vault_address: None, // No vault support by permit yet
             yield_enabled: false,
             is_pending: false,
+            is_recurrent: false,
+            cycle_duration: 0,
+            cancellation_type: 0,
         };
 
         storage::set_stream(&env, stream_id, &stream);
         storage::update_stats(&env, args.total_amount, &sender_addr, &args.receiver);
 
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(args.receiver.clone().into_val(&env));
+        data.push_back(args.token.clone().into_val(&env));
+        data.push_back(args.total_amount.into_val(&env));
+        data.push_back(args.cliff_time.into_val(&env));
+        data.push_back(args.nonce.into_val(&env));
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
-            (symbol_short!("permit"), args.receiver.clone()),
-            PermitStreamCreatedEvent {
-                stream_id,
-                sender_pubkey: args.sender_pubkey,
-                receiver: args.receiver,
-                token: args.token,
-                total_amount: args.total_amount,
-                cliff_time: args.cliff_time,
-                nonce: args.nonce,
+            (stream_id, symbol_short!("permit")),
+            NebulaEvent {
+                version: 2,
                 timestamp: now,
+                action: symbol_short!("permit"),
+                data,
             },
         );
 
@@ -946,27 +1058,36 @@ impl Contract {
                 v1_stream_id: 0,
                 step_duration: args.step_duration,
                 multiplier_bps: args.multiplier_bps,
-                vault_address: None, // Batch creation default to no vault for now
+                vault_address: None, // Batch creation defaults to no vault
                 yield_enabled: false,
                 is_pending: false,
+                is_recurrent: args.is_recurrent,
+                cycle_duration: args.cycle_duration,
+                cancellation_type: args.cancellation_type,
             };
 
             storage::set_stream(&env, stream_id, &stream);
             storage::update_stats(&env, args.total_amount, &args.sender, &args.receiver);
 
-            // Emit individual stream creation event
+            let now = env.ledger().timestamp();
+            let mut data = Vec::new(&env);
+            data.push_back(stream_id.into_val(&env));
+            data.push_back(args.sender.clone().into_val(&env));
+            data.push_back(args.receiver.clone().into_val(&env));
+            data.push_back(args.token.clone().into_val(&env));
+            data.push_back(args.total_amount.into_val(&env));
+            data.push_back(args.start_time.into_val(&env));
+            data.push_back(args.cliff_time.into_val(&env));
+            data.push_back(args.end_time.into_val(&env));
+            data.push_back(now.into_val(&env));
+
             env.events().publish(
-                (symbol_short!("create_v2"), args.sender.clone()),
-                StreamCreatedV2Event {
-                    stream_id,
-                    sender: args.sender.clone(),
-                    receiver: args.receiver.clone(),
-                    token: args.token.clone(),
-                    total_amount: args.total_amount,
-                    start_time: args.start_time,
-                    cliff_time: args.cliff_time,
-                    end_time: args.end_time,
-                    timestamp: env.ledger().timestamp(),
+                (stream_id, symbol_short!("create_v2")),
+                NebulaEvent {
+                    version: 2,
+                    timestamp: now,
+                    action: symbol_short!("create_v2"),
+                    data,
                 },
             );
 
@@ -975,14 +1096,20 @@ impl Contract {
         }
 
         // Emit batch creation summary event
+        let now = env.ledger().timestamp();
+        let mut batch_data = Vec::new(&env);
+        batch_data.push_back(sender.clone().into_val(&env));
+        batch_data.push_back((stream_ids.len() as u32).into_val(&env));
+        batch_data.push_back(total_created_amount.into_val(&env));
+        batch_data.push_back(now.into_val(&env));
+
         env.events().publish(
             (Symbol::new(&env, "batch_create"), sender.clone()),
-            BatchStreamsCreatedEvent {
-                stream_ids: stream_ids.clone(),
-                sender: sender.clone(),
-                total_streams: stream_ids.len() as u32,
-                total_amount: total_created_amount,
-                timestamp: env.ledger().timestamp(),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: Symbol::new(&env, "batch_create"),
+                data: batch_data,
             },
         );
 
@@ -1000,11 +1127,17 @@ impl Contract {
         let execution_time = env.ledger().timestamp() + storage::ADMIN_DELAY;
         storage::schedule_op(&env, &op, execution_time);
 
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(execution_time.into_val(&env));
+
         env.events().publish(
             (symbol_short!("schedule"),),
-            OperationScheduledEvent {
-                op,
-                execution_time,
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("schedule"),
+                data,
             },
         );
 
@@ -1036,10 +1169,17 @@ impl Contract {
 
         storage::clear_op(&env, &op);
 
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(now.into_val(&env));
+
         env.events().publish(
             (symbol_short!("executed"),),
-            OperationExecutedEvent {
-                op,
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("executed"),
+                data,
             },
         );
 
@@ -1047,88 +1187,153 @@ impl Contract {
     }
 
     // ----------------------------------------------------------------
-    // Governance: Stream-Weighted Voting Power
+    // Issue: Recurrent Streams — refill_stream
     // ----------------------------------------------------------------
 
-    /// Calculate the total value currently locked in active streams for a user.
-    /// This represents the user's "skin in the game" for governance purposes.
-    pub fn get_active_volume(env: Env, user: Address) -> i128 {
-        let total_streams = storage::get_health(&env).total_v2_streams;
-        let mut total_locked: i128 = 0;
+    /// Attempt to auto-renew a recurrent stream after its cycle has ended.
+    ///
+    /// The contract uses `transfer_from` to pull `total_amount` tokens from
+    /// the sender — the sender must have pre-approved the contract as spender
+    /// via the token's `approve` function before calling this.
+    ///
+    /// - If the transfer succeeds: a new cycle begins immediately.
+    /// - If the transfer fails (insufficient allowance / balance):
+    ///   `is_recurrent` is set to `false` and the stream stays completed.
+    ///
+    /// This function is permissionless and can be triggered by keeper bots.
+    pub fn refill_stream(env: Env, stream_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
 
-        for i in 0..total_streams {
-            if let Some(stream) = storage::get_stream(&env, i) {
-                if !stream.cancelled {
-                    if stream.sender == user || stream.receiver == user {
-                        let locked = stream.total_amount.saturating_sub(stream.withdrawn_amount);
-                        total_locked = total_locked.saturating_add(locked);
-                    }
-                }
-            }
+        let mut stream =
+            storage::get_stream(&env, stream_id).ok_or(Error::StreamNotFound)?;
+
+        if !stream.is_recurrent {
+            return Err(Error::NotRecurrent);
         }
-        total_locked
-    }
-
-    // ----------------------------------------------------------------
-    // Compliance: Asset "Clawback" Support Logic
-    // ----------------------------------------------------------------
-
-    /// Compare the actual token balance in the contract with the sum of all
-    /// active stream remaining balances.
-    pub fn check_balance_integrity(env: Env, token: Address) -> (i128, i128) {
-        let total_streams = storage::get_health(&env).total_v2_streams;
-        let mut sum_remaining: i128 = 0;
-
-        for i in 0..total_streams {
-            if let Some(stream) = storage::get_stream(&env, i) {
-                if !stream.cancelled && stream.token == token {
-                    let remaining = stream.total_amount.saturating_sub(stream.withdrawn_amount);
-                    sum_remaining = sum_remaining.saturating_add(remaining);
-                }
-            }
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
         }
 
-        let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        (contract_balance, sum_remaining)
-    }
+        let now = env.ledger().timestamp();
+        if now < stream.end_time {
+            return Err(Error::StreamNotExpired);
+        }
 
-    /// Proportionally reduce all active streams for a token if the contract
-    /// balance is less than the total committed amount.
-    pub fn rebalance_after_clawback(env: Env, token: Address) -> Result<(), Error> {
-        let admin = storage::try_get_admin(&env)?;
-        admin.require_auth();
+        let original_amount = stream.total_amount;
+        let token_client = soroban_sdk::token::TokenClient::new(&env, &stream.token);
 
-        let (balance, sum_remaining) = Self::check_balance_integrity(env.clone(), token.clone());
-        if balance >= sum_remaining || sum_remaining == 0 {
+        // Contract is the approved spender; sender must have set allowance beforehand.
+        let result = token_client.try_transfer_from(
+            &env.current_contract_address(),
+            &stream.sender,
+            &env.current_contract_address(),
+            &original_amount,
+        );
+
+        if result.is_err() {
+            // Allowance exhausted or transfer failed — disable recurrence.
+            stream.is_recurrent = false;
+            storage::set_stream(&env, stream_id, &stream);
             return Ok(());
         }
 
-        let reduction_factor_bps = (balance * 10000) / sum_remaining;
-        let total_streams = storage::get_health(&env).total_v2_streams;
-        for i in 0..total_streams {
-            if let Some(mut stream) = storage::get_stream(&env, i) {
-                if !stream.cancelled && stream.token == token {
-                    let old_remaining = stream.total_amount.saturating_sub(stream.withdrawn_amount);
-                    let new_remaining = (old_remaining * reduction_factor_bps) / 10000;
-                    stream.total_amount = stream.withdrawn_amount + new_remaining;
-                    storage::set_stream(&env, i, &stream);
-                }
-            }
-        }
+        let old_end_time = stream.end_time;
+        let new_end_time = old_end_time + stream.cycle_duration;
+
+        stream.start_time = old_end_time;
+        stream.end_time = new_end_time;
+        stream.withdrawn_amount = 0; // Reset for the new cycle
+
+        storage::set_stream(&env, stream_id, &stream);
+        storage::update_stats(&env, original_amount, &stream.sender, &stream.receiver);
+
+        let mut data = Vec::new(&env);
+        data.push_back(stream_id.into_val(&env));
+        data.push_back(stream.sender.clone().into_val(&env));
+        data.push_back(original_amount.into_val(&env));
+        data.push_back(old_end_time.into_val(&env));
+        data.push_back(new_end_time.into_val(&env));
+        data.push_back(now.into_val(&env));
 
         env.events().publish(
-            (symbol_short!("rebalance"), token.clone()),
-            ClawbackRebalanceEvent {
-                token,
-                total_remaining: sum_remaining,
-                contract_balance: balance,
-                reduction_factor_bps,
-                timestamp: env.ledger().timestamp(),
+            (stream_id, symbol_short!("refill")),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("refill"),
+                data,
             },
         );
 
         Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Issue: Affiliate Fee Split — admin helpers + fee withdrawal
+    // ----------------------------------------------------------------
+
+    /// Set the protocol treasury address. Admin-only.
+    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), Error> {
+        storage::try_get_admin(&env)?.require_auth();
+        storage::set_treasury(&env, &treasury);
+        Ok(())
+    }
+
+    /// Get the current treasury address.
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        storage::get_treasury(&env)
+    }
+
+    /// Set the protocol fee in basis points (e.g. 100 = 1%). Admin-only.
+    pub fn set_fee_bps(env: Env, bps: u32) -> Result<(), Error> {
+        storage::try_get_admin(&env)?.require_auth();
+        storage::set_fee_bps(&env, bps);
+        Ok(())
+    }
+
+    /// Get the current protocol fee in basis points.
+    pub fn get_fee_bps(env: Env) -> u32 {
+        storage::get_fee_bps(&env)
+    }
+
+    /// Withdraw accumulated protocol fees for `(recipient, token)`.
+    /// The recipient must authorise this call.
+    pub fn withdraw_fees(env: Env, recipient: Address, token: Address) -> Result<i128, Error> {
+        recipient.require_auth();
+
+        let amount = storage::get_pending_fees(&env, &recipient, &token);
+        if amount <= 0 {
+            return Err(Error::NothingToWithdraw);
+        }
+
+        storage::clear_pending_fees(&env, &recipient, &token);
+
+        let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        let now = env.ledger().timestamp();
+        let mut data = Vec::new(&env);
+        data.push_back(recipient.clone().into_val(&env));
+        data.push_back(token.clone().into_val(&env));
+        data.push_back(amount.into_val(&env));
+        data.push_back(now.into_val(&env));
+
+        env.events().publish(
+            (symbol_short!("fee_out"), recipient.clone()),
+            NebulaEvent {
+                version: 2,
+                timestamp: now,
+                action: symbol_short!("fee_out"),
+                data,
+            },
+        );
+
+        Ok(amount)
+    }
+
+    /// Query pending fee balance for a `(recipient, token)` pair.
+    pub fn get_pending_fees(env: Env, recipient: Address, token: Address) -> i128 {
+        storage::get_pending_fees(&env, &recipient, &token)
     }
 }
 

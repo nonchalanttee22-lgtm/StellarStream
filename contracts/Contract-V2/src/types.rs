@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Val, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +20,12 @@ pub struct StreamV2 {
     pub vault_address: Option<Address>,
     pub yield_enabled: bool,
     pub is_pending: bool,
+    /// Whether this stream auto-renews each cycle (Issue: Recurrent Streams)
+    pub is_recurrent: bool,
+    /// Duration of each recurrence cycle in seconds (Issue: Recurrent Streams)
+    pub cycle_duration: u64,
+    /// 0 = Unilateral cancellation, 1 = Mutual (both parties required) (Issue: Joint Signature)
+    pub cancellation_type: u32,
 }
 
 #[contracttype]
@@ -36,6 +42,14 @@ pub struct StreamArgs {
     pub multiplier_bps: i128,
     pub vault_address: Option<Address>,
     pub yield_enabled: bool,
+    /// Enable monthly auto-renewal via transfer_from allowance
+    pub is_recurrent: bool,
+    /// Cycle length in seconds (e.g. 2_592_000 for ~30 days)
+    pub cycle_duration: u64,
+    /// 0 = Unilateral, 1 = Mutual cancellation
+    pub cancellation_type: u32,
+    /// Optional affiliate address for fee-split (Issue: Affiliate Fee Split)
+    pub affiliate: Option<Address>,
 }
 
 #[contracttype]
@@ -262,5 +276,49 @@ pub struct StreamToppedUpEvent {
     pub extra_amount: i128,
     pub new_total_amount: i128,
     pub new_end_time: u64,
+    pub timestamp: u64,
+}
+
+// ----------------------------------------------------------------
+// Issue: Standardized V2 Events (NebulaEvent)
+// ----------------------------------------------------------------
+
+/// Standardized event wrapper for all V2 contract actions.
+/// The Indexer uses `version` to distinguish V1 vs V2 data.
+/// For stream-related events, `stream_id` is always the first topic.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct NebulaEvent {
+    pub version: u32,
+    pub timestamp: u64,
+    pub action: Symbol,
+    pub data: Vec<Val>,
+}
+
+// ----------------------------------------------------------------
+// Issue: Recurrent Streams Events
+// ----------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamRefilledEvent {
+    pub stream_id: u64,
+    pub sender: Address,
+    pub amount: i128,
+    pub new_start_time: u64,
+    pub new_end_time: u64,
+    pub timestamp: u64,
+}
+
+// ----------------------------------------------------------------
+// Issue: Affiliate Fee Split Events
+// ----------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeesWithdrawnEvent {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
     pub timestamp: u64,
 }
