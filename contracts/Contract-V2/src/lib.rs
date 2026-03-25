@@ -13,6 +13,7 @@ pub use types::{
     AdminTransferredEvent, BatchStreamsCreatedEvent, ContractPausedEvent, ContractUnpausedEvent, MigrationEvent, PermitArgs, PermitStreamCreatedEvent, StreamArgs,
     StreamCancelledV2Event, StreamClaimV2Event, StreamCreatedV2Event, StreamMigratedEvent,
     StreamV2, Operation, OperationScheduledEvent, OperationExecutedEvent, BeneficiaryTransferredV2Event,
+    StreamV2, Operation, OperationScheduledEvent, OperationExecutedEvent,
 };
 use v1_interface::Client as V1Client;
 
@@ -79,6 +80,9 @@ impl Contract {
     fn transfer_admin_internal(env: Env, new_admin: Address) -> Result<(), Error> {
         let previous_admin = storage::try_get_admin(&env)?;
         // Auth handled in execute_op
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let previous_admin = storage::try_get_admin(&env)?;
+        previous_admin.require_auth();
 
         storage::set_admin(&env, &new_admin);
 
@@ -106,6 +110,8 @@ impl Contract {
     /// Override the minimum for a specific asset. Admin-only.
     /// Internal helper for set_min_value.
     fn set_min_value_internal(env: Env, asset: Address, min: i128) -> Result<(), Error> {
+    pub fn set_min_value(env: Env, asset: Address, min: i128) -> Result<(), Error> {
+        storage::try_get_admin(&env)?.require_auth();
         storage::set_min_value(&env, &asset, min);
         Ok(())
     }
@@ -219,6 +225,7 @@ impl Contract {
     // ----------------------------------------------------------------
 
     pub fn withdraw(env: Env, stream_id: u64, beneficiary: Address) -> Result<i128, Error> {
+    pub fn withdraw(env: Env, stream_id: u64, receiver: Address) -> Result<i128, Error> {
         Self::require_not_paused(&env)?;
         beneficiary.require_auth();
 
@@ -227,6 +234,8 @@ impl Contract {
 
         if stream.beneficiary != beneficiary {
             return Err(Error::NotBeneficiary);
+        if stream.receiver != receiver {
+            return Err(Error::NotStreamOwner);
         }
 
         if stream.cancelled {
@@ -279,6 +288,8 @@ impl Contract {
 
         if stream.sender != caller && stream.beneficiary != caller {
             return Err(Error::NotBeneficiary);
+        if stream.sender != caller && stream.receiver != caller {
+            return Err(Error::NotStreamOwner);
         }
 
         if stream.cancelled {
