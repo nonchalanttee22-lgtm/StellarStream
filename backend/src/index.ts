@@ -30,6 +30,7 @@ import { DataIntegrityWorker } from "./data-integrity.worker.js";
 import { YieldAccrualWorker } from "./yield-accrual.worker.js";
 import { bigintSerializer } from "./middleware/bigintSerializer.js";
 import { swaggerSpec } from "./swagger.js";
+import { initializeSchedulers } from "./schedulers.js";
 
 Sentry.init({
   dsn: process.env.SENTRY_DSN,
@@ -165,6 +166,7 @@ Sentry.setupExpressErrorHandler(app);
 async function start(): Promise<void> {
   await ensureRedis();
   scheduleSnapshotMaintenance();
+  initializeSchedulers();
   cleanupWorker.start();
   dataIntegrityWorker.start();
   yieldAccrualWorker.start();
