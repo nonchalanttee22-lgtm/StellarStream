@@ -23,6 +23,14 @@ pub struct Recipient {
     pub share_bps: u32,
 }
 
+/// A recipient with a percentage share expressed in basis points for `split_percentage`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PercentRecipient {
+    pub address: Address,
+    pub bps: u32,
+}
+
 /// The protocol setting being changed by a quorum proposal.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -673,6 +681,49 @@ impl SplitterV3 {
         for r in recipients.iter() {
             let amount = total_amount
                 .checked_mul(r.share_bps as i128)
+                .ok_or(Error::Overflow)?
+                / 10_000;
+            if amount > 0 {
+                token_client.transfer(&contract_addr, &r.address, &amount);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── split_percentage: percentage-based split ──────────────────────────────
+
+    /// Split `total_amount` of `asset` among `recipients` using basis-point
+    /// percentages.  The sum of all `bps` values must equal exactly 10_000.
+    pub fn split_percentage(
+        env: Env,
+        sender: Address,
+        asset: Address,
+        total_amount: i128,
+        recipients: Vec<PercentRecipient>,
+    ) -> Result<(), Error> {
+        sender.require_auth();
+
+        if recipients.is_empty() {
+            return Err(Error::EmptyRecipients);
+        }
+
+        // Validate bps sum == 10_000.
+        let mut bps_sum: u32 = 0;
+        for r in recipients.iter() {
+            bps_sum = bps_sum.checked_add(r.bps).ok_or(Error::Overflow)?;
+        }
+        if bps_sum != 10_000 {
+            return Err(Error::InvalidBpsSum);
+        }
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&sender, &contract_addr, &total_amount);
+
+        for r in recipients.iter() {
+            let amount = total_amount
+                .checked_mul(r.bps as i128)
                 .ok_or(Error::Overflow)?
                 / 10_000;
             if amount > 0 {
