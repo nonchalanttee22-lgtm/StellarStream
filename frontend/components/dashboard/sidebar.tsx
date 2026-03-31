@@ -25,6 +25,8 @@ import {
   ScrollText,
   Rocket,
   Coins,
+  FileText,
+  Share2,
   Share2,
   ArrowRightLeft,
 } from "lucide-react";

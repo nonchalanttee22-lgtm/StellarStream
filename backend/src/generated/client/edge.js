@@ -512,6 +512,7 @@ const config = {
       "value": "prisma-client-js"
     },
     "output": {
+      "value": "C:\\Users\\pc\\drips\\StellarStream\\backend\\src\\generated\\client",
       "value": "C:\\Users\\olani\\OneDrive\\Desktop\\StellarStream\\backend\\src\\generated\\client",
       "fromEnvVar": null
     },
@@ -526,6 +527,7 @@ const config = {
       }
     ],
     "previewFeatures": [],
+    "sourceFilePath": "C:\\Users\\pc\\drips\\StellarStream\\backend\\prisma\\schema.prisma",
     "sourceFilePath": "C:\\Users\\olani\\OneDrive\\Desktop\\StellarStream\\backend\\prisma\\schema.prisma",
     "isCustomOutput": true
   },
